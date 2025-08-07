@@ -8,10 +8,16 @@
 
 #ifndef _PIPE_H_
 #define _PIPE_H_
+
 #define IC_BLOCK_SIZE   32 // 32 bytes
 #define IC_NUM_WAYS     4 // 4 way set associative cache
 #define IC_NUM_SETS     64 // 64 sets
-#define IC_INDEX_MASK   3 // num_ways - 1
+#define IC_INDEX_MASK   3 // [10:5]
+
+#define DC_BLOCK_SIZE   32
+#define DC_NUM_WAYS     8
+#define DC_NUM_SETS     256
+#define DC_INDEX_MASK   7 // [12:5]
 
 #include "shell.h"
 
@@ -32,7 +38,28 @@ typedef struct {
     uint32_t miss_block_pc;
 } InstructionCache;
 
+typedef struct {
+    uint32_t tag;
+    uint8_t valid;
+    uint8_t dirty;
+    uint32_t last_used;
+    int32_t block_addr;
+} DataCacheLine;
+
+typedef struct {
+    DataCacheLine ways[DC_NUM_WAYS];
+} DataCacheSet;
+
+typedef struct {
+    DataCacheSet sets[DC_NUM_SETS];
+    uint32_t use_clock;
+    int miss_stall;
+    uint32_t miss_block_addr;
+    int miss_is_store;
+} DataCache;
+
 extern InstructionCache icache;
+extern DataCache dcache;
 
 /* Pipeline ops (instances of this structure) are high-level representations of
  * the instructions that actually flow through the pipeline. This struct does
@@ -136,10 +163,18 @@ void pipe_stage_execute();
 void pipe_stage_mem();
 void pipe_stage_wb();
 
+// instruction cache methods
 void icache_init(void);
 int icache_hit(uint32_t pc);
 void icache_start_miss(uint32_t pc);
 int icache_advance_miss(void);
 void icache_fill_current_miss(void);
+
+// data cache methods
+void dcache_init(void);
+int dcache_hit(uint32_t addr);
+void dcache_start_miss(uint32_t addr, int is_store);
+int dcache_advance_miss(void);
+void dcache_fill_current_miss(void);
 
 #endif

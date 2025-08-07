@@ -17,6 +17,7 @@
 //#define DEBUG
 
 InstructionCache icache;
+DataCache dcache;
 
 void icache_init(void) {
     memset(&icache, 0, sizeof(icache));
@@ -94,6 +95,89 @@ void icache_fill_current_miss(void) {
     ic_touch(set, victim);
 }
 
+void dcache_init(void) {
+    memset(&dcache, 0, sizeof(dcache));
+}
+
+static inline uint32_t dc_index(uint32_t addr) {
+    return (addr >> 5) & DC_INDEX_MASK;
+}
+
+static inline uint32_t dc_tag(uint32_t addr) {
+    return addr >> 13;
+}
+
+static void dc_touch(DataCacheSet *set, int way) {
+    dcache.use_clock++;
+    set->ways[way].last_used = dcache.use_clock;
+}
+
+int dcache_hit(uint32_t addr) {
+    uint32_t idx = dc_index(addr);
+    uint32_t tag = dc_tag(addr);
+    DataCacheSet *set = &dcache.sets[idx];
+
+    for (int way_index = 0; way_index < DC_NUM_WAYS; way_index++) {
+        if (set->ways[way_index].valid && set->ways[way_index].tag == tag) {
+            dc_touch(set, way_index);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+void dcache_start_miss(uint32_t addr, int is_store) {
+    dcache.miss_block_addr = addr & ~(DC_BLOCK_SIZE - 1);
+    dcache.miss_is_store = is_store;
+    dcache.miss_stall = 50;
+}
+
+int dcache_advance_miss(void) {
+    if (dcache.miss_stall > 0) {
+        dcache.miss_stall--;
+        return dcache.miss_stall == 0;
+    }
+
+    return 0;
+}
+
+void dcache_fill_current_miss(void) {
+    uint32_t idx = dc_index(dcache.miss_block_addr);
+    uint32_t tag = dc_tag(dcache.miss_block_addr);
+    DataCacheSet *set = &dcache.sets[idx];
+
+    int victim = -1;
+    for (int way_index = 0; way_index < DC_NUM_WAYS; way_index++) {
+        if (!set->ways[way_index].valid) {
+            victim = way_index;
+            break;
+        }
+    }
+
+    if (victim == -1) {
+        uint32_t lru = set->ways[0].last_used;
+        victim = 0;
+
+        for (int way_index = 1; way_index < DC_NUM_WAYS; way_index++) {
+            if (set->ways[way_index].last_used < lru) {
+                lru = set->ways[way_index].last_used;
+                victim = way_index;
+            }
+        }
+
+        if (set->ways[victim].dirty) {
+            mem_write_32(set->ways[victim].block_addr, 0);
+        }
+    }
+
+    set->ways[victim].valid = 1;
+    set->ways[victim].dirty = dcache.miss_is_store;
+    set->ways[victim].tag = tag;
+    set->ways[victim].block_addr = dcache.miss_block_addr;
+    dc_touch(set, victim);
+}
+
 /* debug */
 void print_op(Pipe_Op *op)
 {
@@ -113,6 +197,7 @@ void pipe_init()
     memset(&pipe, 0, sizeof(Pipe_State));
     pipe.PC = 0x00400000;
     icache_init();
+    dcache_init();
 }
 
 void pipe_cycle()
@@ -223,8 +308,19 @@ void pipe_stage_mem()
     Pipe_Op *op = pipe.mem_op;
 
     uint32_t val = 0;
-    if (op->is_mem)
-        val = mem_read_32(op->mem_addr & ~3);
+    if (dcache.miss_stall > 0) {
+        if (dcache_advance_miss()) {
+            dcache_fill_current_miss();
+        } else {
+            return;
+        }
+    }
+
+    if (!dcache_hit(op->mem_addr)) {
+        dcache_start_miss(op->mem_addr, op->mem_write);
+        return;
+    }
+    val = mem_read_32(op->mem_addr & ~3);
 
     switch (op->opcode) {
         case OP_LW:
@@ -273,7 +369,7 @@ void pipe_stage_mem()
             }
             break;
 
-        case OP_SB:
+        case OP_SB: {
             switch (op->mem_addr & 3) {
                 case 0: val = (val & 0xFFFFFF00) | ((op->mem_value & 0xFF) << 0); break;
                 case 1: val = (val & 0xFFFF00FF) | ((op->mem_value & 0xFF) << 8); break;
@@ -282,9 +378,23 @@ void pipe_stage_mem()
             }
 
             mem_write_32(op->mem_addr & ~3, val);
-            break;
 
-        case OP_SH:
+            // mark dirty bit
+            uint32_t idx = dc_index(op->mem_addr);
+            uint32_t tag = dc_tag(op->mem_addr);
+            DataCacheSet *set = &dcache.sets[idx];
+
+            for (int way_index = 0; way_index < DC_NUM_WAYS; way_index++) {
+                if (set->ways[way_index].valid && set->ways[way_index].tag == tag) {
+                    set->ways[way_index].dirty = 1;
+                    break;
+                }
+            }
+
+            break;
+        }
+
+        case OP_SH: {
 #ifdef DEBUG
             printf("SH: addr %08x val %04x old word %08x\n", op->mem_addr, op->mem_value & 0xFFFF, val);
 #endif
@@ -297,12 +407,40 @@ void pipe_stage_mem()
 #endif
 
             mem_write_32(op->mem_addr & ~3, val);
-            break;
 
-        case OP_SW:
+            // mark dirty bit
+            uint32_t idx = dc_index(op->mem_addr);
+            uint32_t tag = dc_tag(op->mem_addr);
+            DataCacheSet *set = &dcache.sets[idx];
+
+            for (int way_index = 0; way_index < DC_NUM_WAYS; way_index++) {
+                if (set->ways[way_index].valid && set->ways[way_index].tag == tag) {
+                    set->ways[way_index].dirty = 1;
+                    break;
+                }
+            }
+
+            break;
+        }
+
+        case OP_SW: {
             val = op->mem_value;
             mem_write_32(op->mem_addr & ~3, val);
+
+            // mark dirty bit
+            uint32_t idx = dc_index(op->mem_addr);
+            uint32_t tag = dc_tag(op->mem_addr);
+            DataCacheSet *set = &dcache.sets[idx];
+
+            for (int way_index = 0; way_index < DC_NUM_WAYS; way_index++) {
+                if (set->ways[way_index].valid && set->ways[way_index].tag == tag) {
+                    set->ways[way_index].dirty = 1;
+                    break;
+                }
+            }
+
             break;
+        }
     }
 
     /* clear stage input and transfer to next stage */
