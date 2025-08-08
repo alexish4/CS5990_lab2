@@ -12,12 +12,12 @@
 #define IC_BLOCK_SIZE   32 // 32 bytes
 #define IC_NUM_WAYS     4 // 4 way set associative cache
 #define IC_NUM_SETS     64 // 64 sets
-#define IC_INDEX_MASK   3 // [10:5]
+#define IC_INDEX_MASK   63
 
 #define DC_BLOCK_SIZE   32
 #define DC_NUM_WAYS     8
 #define DC_NUM_SETS     256
-#define DC_INDEX_MASK   7 // [12:5]
+#define DC_INDEX_MASK   255
 
 #include "shell.h"
 
