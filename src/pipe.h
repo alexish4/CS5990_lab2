@@ -19,7 +19,20 @@
 #define DC_NUM_SETS     256
 #define DC_INDEX_MASK   255
 
+typedef enum { REPL_LRU, REPL_FIFO, REPL_RANDOM, REPL_PLRU } Rep1Policy;
+typedef enum { INSERT_MRU, INSERT_BIP } InsertPolicy;
+
 #include "shell.h"
+
+typedef struct { // make cache configurable for benchmarks
+    int size_kb;
+    int block_bytes;
+    int ways;
+    int sets;
+
+    Rep1Policy rep1;
+    InsertPolicy insert;
+} CacheCfg;
 
 typedef struct {
     uint32_t tag;
@@ -28,11 +41,15 @@ typedef struct {
 } InstructionCacheLine;
 
 typedef struct {
-    InstructionCacheLine ways[IC_NUM_WAYS];
+    InstructionCacheLine *ways;
 } InstructionCacheSet;
 
 typedef struct {
-    InstructionCacheSet sets[IC_NUM_SETS];
+    CacheCfg icache_cfg;
+    uint32_t offset_bits;
+    uint32_t index_bits;
+    uint32_t index_mask;
+    InstructionCacheSet *sets;
     uint32_t use_clock;
     int miss_stall;
     uint32_t miss_block_pc;
@@ -47,11 +64,15 @@ typedef struct {
 } DataCacheLine;
 
 typedef struct {
-    DataCacheLine ways[DC_NUM_WAYS];
+    DataCacheLine *ways;
 } DataCacheSet;
 
 typedef struct {
-    DataCacheSet sets[DC_NUM_SETS];
+    CacheCfg dcache_cfg;
+    uint32_t offset_bits;
+    uint32_t index_bits;
+    uint32_t index_mask;
+    DataCacheSet *sets;
     uint32_t use_clock;
     int miss_stall;
     uint32_t miss_block_addr;

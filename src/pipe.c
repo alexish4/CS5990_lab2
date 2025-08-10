@@ -19,16 +19,54 @@
 InstructionCache icache;
 DataCache dcache;
 
+static inline uint32_t log2u(uint32_t x) {
+    assert(x && ((x & (x - 1)) == 0));
+
+    #if defined (__GNUC__)
+        return __builtin_ctz(x);
+    #else
+        uint32_t r = 0; while ((1u << r) != x) r++; return r;
+    #endif
+}
+
 void icache_init(void) {
     memset(&icache, 0, sizeof(icache));
+
+    icache.icache_cfg.size_kb = icache.icache_cfg.size_kb ? icache.icache_cfg.size_kb : 8;
+    icache.icache_cfg.block_bytes = icache.icache_cfg.block_bytes ? icache.icache_cfg.block_bytes : 32;
+    icache.icache_cfg.ways = icache.icache_cfg.ways ? icache.icache_cfg.ways : 4;
+    icache.icache_cfg.sets = icache.icache_cfg.sets;
+
+    if (icache.icache_cfg.sets == 0) {
+        int cap = icache.icache_cfg.size_kb * 1024;
+        icache.icache_cfg.sets = cap / (icache.icache_cfg.block_bytes * icache.icache_cfg.ways);
+    }
+
+    if (icache.icache_cfg.rep1 == 0 && icache.icache_cfg.insert == 0) {
+        icache.icache_cfg.rep1 = REPL_LRU;
+        icache.icache_cfg.insert = INSERT_MRU;
+    }
+
+    assert(((icache.icache_cfg.size_kb * 1024) % (icache.icache_cfg.block_bytes * icache.icache_cfg.ways)) == 0);
+    assert((icache.icache_cfg.block_bytes & (icache.icache_cfg.block_bytes - 1)) == 0);
+    assert((icache.icache_cfg.sets & (icache.icache_cfg.sets - 1)) == 0);
+
+    icache.offset_bits = log2u(icache.icache_cfg.block_bytes);
+    icache.index_bits = log2u(icache.icache_cfg.sets);
+    icache.index_mask = (1u << icache.index_bits) - 1;
+
+    icache.sets = (InstructionCacheSet*)calloc(icache.icache_cfg.sets, sizeof(InstructionCacheSet));
+    for (int set_index = 0; set_index < icache.icache_cfg.sets; set_index++) {
+        icache.sets[set_index].ways = calloc(icache.icache_cfg.ways, sizeof(InstructionCacheLine));
+    }
 }
 
 static inline uint32_t ic_index(uint32_t pc) {
-    return (pc >> 5) & IC_INDEX_MASK;
+    return (pc >> icache.offset_bits) & icache.index_mask;
 }
 
 static inline uint32_t ic_tag(uint32_t pc) {
-    return pc >> 11;
+    return pc >> (icache.offset_bits + icache.index_bits);
 }
 
 static void ic_touch(InstructionCacheSet *set, int way) {
@@ -41,7 +79,7 @@ int icache_hit(uint32_t pc) {
     uint32_t tag = ic_tag(pc);
     InstructionCacheSet *set = &icache.sets[idx];
 
-    for (int way_index = 0; way_index < IC_NUM_WAYS; way_index++) {
+    for (int way_index = 0; way_index < icache.icache_cfg.ways; way_index++) {
         if (set->ways[way_index].valid && set->ways[way_index].tag == tag) {
             ic_touch(set, way_index);
             return 1;
@@ -52,7 +90,7 @@ int icache_hit(uint32_t pc) {
 }
 
 void icache_start_miss(uint32_t pc) {
-    icache.miss_block_pc = pc & ~(IC_BLOCK_SIZE - 1);
+    icache.miss_block_pc = pc & ~(uint32_t)(icache.icache_cfg.block_bytes - 1);
     icache.miss_stall = 50;
 }
 
@@ -71,7 +109,7 @@ void icache_fill_current_miss(void) {
     InstructionCacheSet *set = &icache.sets[idx];
 
     int victim = -1;
-    for (int way_index = 0; way_index < IC_NUM_WAYS; way_index++) {
+    for (int way_index = 0; way_index < icache.icache_cfg.ways; way_index++) {
         if (!set->ways[way_index].valid) {
             victim = way_index;
             break;
@@ -79,32 +117,104 @@ void icache_fill_current_miss(void) {
     }
 
     if (victim == -1) {
-        uint32_t best = set->ways[0].last_used;
-        victim = 0;
+        switch (icache.icache_cfg.rep1) {
+            case REPL_LRU: {
+                uint32_t best = set->ways[0].last_used;
+                victim = 0;
 
-        for (int way_index = 1; way_index < IC_NUM_WAYS; way_index++) {
-            if (set->ways[way_index].last_used < best) {
-                best = set->ways[way_index].last_used;
-                victim = way_index;
+                for (int way_index = 1; way_index < icache.icache_cfg.ways; way_index++) {
+                    if (set->ways[way_index].last_used < best) {
+                        best = set->ways[way_index].last_used;
+                        victim = way_index;
+                    }
+                }
+
+                break;
             }
+
+            case REPL_FIFO: {
+                uint32_t oldest = set->ways[0].last_used;
+                victim = 0;
+
+                for (int way_index = 1; way_index < icache.icache_cfg.ways; way_index++) {
+                    if (set->ways[way_index].last_used < oldest) {
+                        oldest = set->ways[way_index].last_used;
+                        victim = way_index;
+                    }
+                }
+
+                break;
+            }
+
+            case REPL_RANDOM: {
+                victim = rand() % icache.icache_cfg.ways;
+                break;
+            }
+
+            case REPL_PLRU: {
+                uint32_t best = set->ways[0].last_used;
+                victim = 0;
+
+                for (int way_index = 1; way_index < icache.icache_cfg.ways; way_index++) {
+                    if (set->ways[way_index].last_used < best) {
+                        best = set->ways[way_index].last_used;
+                        victim = way_index;
+                    }
+                }
+
+                break;
+            }
+            
         }
     }
 
     set->ways[victim].tag = tag;
     set->ways[victim].valid = 1;
-    ic_touch(set, victim);
+    if (icache.icache_cfg.insert == INSERT_MRU) {            
+        ic_touch(set, victim);
+    } else {
+        if ((rand() & 31) == 0) ic_touch(set, victim);
+    }
 }
 
 void dcache_init(void) {
     memset(&dcache, 0, sizeof(dcache));
+
+    dcache.dcache_cfg.size_kb = dcache.dcache_cfg.size_kb ? dcache.dcache_cfg.size_kb : 8;
+    dcache.dcache_cfg.block_bytes = dcache.dcache_cfg.block_bytes ? dcache.dcache_cfg.block_bytes : 32;
+    dcache.dcache_cfg.ways = dcache.dcache_cfg.ways ? dcache.dcache_cfg.ways : 4;
+    dcache.dcache_cfg.sets = dcache.dcache_cfg.sets;
+
+    if (dcache.dcache_cfg.sets == 0) {
+        int cap = dcache.dcache_cfg.size_kb * 1024;
+        dcache.dcache_cfg.sets = cap / (dcache.dcache_cfg.block_bytes * dcache.dcache_cfg.ways);
+    }
+
+    if (dcache.dcache_cfg.rep1 == 0 && dcache.dcache_cfg.insert == 0) {
+        dcache.dcache_cfg.rep1 = REPL_LRU;
+        dcache.dcache_cfg.insert = INSERT_MRU;
+    }
+
+    assert(((dcache.dcache_cfg.size_kb * 1024) % (dcache.dcache_cfg.block_bytes * dcache.dcache_cfg.ways)) == 0);
+    assert((dcache.dcache_cfg.block_bytes & (dcache.dcache_cfg.block_bytes - 1)) == 0);
+    assert((dcache.dcache_cfg.sets & (dcache.dcache_cfg.sets - 1)) == 0);
+
+    dcache.offset_bits = log2u(dcache.dcache_cfg.block_bytes);
+    dcache.index_bits = log2u(dcache.dcache_cfg.sets);
+    dcache.index_mask = (1u << dcache.index_bits) - 1;
+
+    dcache.sets = (DataCacheSet*)calloc(dcache.dcache_cfg.sets, sizeof(DataCacheSet));
+    for (int set_index = 0; set_index < dcache.dcache_cfg.sets; set_index++) {
+        dcache.sets[set_index].ways = calloc(dcache.dcache_cfg.ways, sizeof(DataCacheLine));
+    }
 }
 
 static inline uint32_t dc_index(uint32_t addr) {
-    return (addr >> 5) & DC_INDEX_MASK;
+    return (addr >> dcache.offset_bits) & dcache.index_mask;
 }
 
 static inline uint32_t dc_tag(uint32_t addr) {
-    return addr >> 13;
+    return addr >> (dcache.offset_bits + dcache.index_bits);
 }
 
 static void dc_touch(DataCacheSet *set, int way) {
@@ -117,7 +227,7 @@ int dcache_hit(uint32_t addr) {
     uint32_t tag = dc_tag(addr);
     DataCacheSet *set = &dcache.sets[idx];
 
-    for (int way_index = 0; way_index < DC_NUM_WAYS; way_index++) {
+    for (int way_index = 0; way_index < dcache.dcache_cfg.ways; way_index++) {
         if (set->ways[way_index].valid && set->ways[way_index].tag == tag) {
             dc_touch(set, way_index);
             return 1;
@@ -128,7 +238,7 @@ int dcache_hit(uint32_t addr) {
 }
 
 void dcache_start_miss(uint32_t addr, int is_store) {
-    dcache.miss_block_addr = addr & ~(DC_BLOCK_SIZE - 1);
+    dcache.miss_block_addr = addr & ~(uint32_t)(dcache.dcache_cfg.block_bytes - 1);
     dcache.miss_is_store = is_store;
     dcache.miss_stall = 50;
 }
@@ -148,7 +258,7 @@ void dcache_fill_current_miss(void) {
     DataCacheSet *set = &dcache.sets[idx];
 
     int victim = -1;
-    for (int way_index = 0; way_index < DC_NUM_WAYS; way_index++) {
+    for (int way_index = 0; way_index < dcache.dcache_cfg.ways; way_index++) {
         if (!set->ways[way_index].valid) {
             victim = way_index;
             break;
@@ -159,23 +269,28 @@ void dcache_fill_current_miss(void) {
         uint32_t lru = set->ways[0].last_used;
         victim = 0;
 
-        for (int way_index = 1; way_index < DC_NUM_WAYS; way_index++) {
+        for (int way_index = 1; way_index < dcache.dcache_cfg.ways; way_index++) {
             if (set->ways[way_index].last_used < lru) {
                 lru = set->ways[way_index].last_used;
                 victim = way_index;
             }
         }
 
-        if (set->ways[victim].dirty) {
-            mem_write_32(set->ways[victim].block_addr, 0);
-        }
+        // if (set->ways[victim].dirty) {
+        //     mem_write_32(set->ways[victim].block_addr, 0);
+        // }
     }
 
     set->ways[victim].valid = 1;
-    set->ways[victim].dirty = dcache.miss_is_store;
+    //set->ways[victim].dirty = dcache.miss_is_store ? 1 : 0;
     set->ways[victim].tag = tag;
     set->ways[victim].block_addr = dcache.miss_block_addr;
-    dc_touch(set, victim);
+    if (dcache.dcache_cfg.insert == INSERT_MRU) {
+        dc_touch(set, victim);
+    } else {
+        if ((rand() & 31) == 0) dc_touch(set, victim);
+    }
+    
 }
 
 /* debug */
@@ -196,6 +311,10 @@ void pipe_init()
 {
     memset(&pipe, 0, sizeof(Pipe_State));
     pipe.PC = 0x00400000;
+
+    icache.icache_cfg = (CacheCfg){ .size_kb=8, .block_bytes=32, .ways=4, .sets=0, .rep1=REPL_LRU, .insert=INSERT_MRU };
+    dcache.dcache_cfg = (CacheCfg){ .size_kb=64, .block_bytes=32, .ways=8, .sets=0, .rep1=REPL_LRU, .insert=INSERT_MRU };
+
     icache_init();
     dcache_init();
 }
@@ -308,19 +427,22 @@ void pipe_stage_mem()
     Pipe_Op *op = pipe.mem_op;
 
     uint32_t val = 0;
-    if (dcache.miss_stall > 0) {
-        if (dcache_advance_miss()) {
-            dcache_fill_current_miss();
-        } else {
+    if(op->is_mem) {
+        if (dcache.miss_stall > 0) {
+            if (dcache_advance_miss()) {
+                dcache_fill_current_miss();
+            } else {
+                return;
+            }
+        }
+
+        if (!dcache_hit(op->mem_addr)) {
+            dcache_start_miss(op->mem_addr, op->mem_write);
             return;
         }
     }
-
-    if (!dcache_hit(op->mem_addr)) {
-        dcache_start_miss(op->mem_addr, op->mem_write);
-        return;
-    }
-    val = mem_read_32(op->mem_addr & ~3);
+    if (op->is_mem)
+        val = mem_read_32(op->mem_addr & ~3);
 
     switch (op->opcode) {
         case OP_LW:
@@ -379,17 +501,17 @@ void pipe_stage_mem()
 
             mem_write_32(op->mem_addr & ~3, val);
 
-            // mark dirty bit
-            uint32_t idx = dc_index(op->mem_addr);
-            uint32_t tag = dc_tag(op->mem_addr);
-            DataCacheSet *set = &dcache.sets[idx];
+            // // mark dirty bit
+            // uint32_t idx = dc_index(op->mem_addr);
+            // uint32_t tag = dc_tag(op->mem_addr);
+            // DataCacheSet *set = &dcache.sets[idx];
 
-            for (int way_index = 0; way_index < DC_NUM_WAYS; way_index++) {
-                if (set->ways[way_index].valid && set->ways[way_index].tag == tag) {
-                    set->ways[way_index].dirty = 1;
-                    break;
-                }
-            }
+            // for (int way_index = 0; way_index < dcache.dcache_cfg.ways; way_index++) {
+            //     if (set->ways[way_index].valid && set->ways[way_index].tag == tag) {
+            //         set->ways[way_index].dirty = 1;
+            //         break;
+            //     }
+            // }
 
             break;
         }
@@ -408,17 +530,17 @@ void pipe_stage_mem()
 
             mem_write_32(op->mem_addr & ~3, val);
 
-            // mark dirty bit
-            uint32_t idx = dc_index(op->mem_addr);
-            uint32_t tag = dc_tag(op->mem_addr);
-            DataCacheSet *set = &dcache.sets[idx];
+            // // mark dirty bit
+            // uint32_t idx = dc_index(op->mem_addr);
+            // uint32_t tag = dc_tag(op->mem_addr);
+            // DataCacheSet *set = &dcache.sets[idx];
 
-            for (int way_index = 0; way_index < DC_NUM_WAYS; way_index++) {
-                if (set->ways[way_index].valid && set->ways[way_index].tag == tag) {
-                    set->ways[way_index].dirty = 1;
-                    break;
-                }
-            }
+            // for (int way_index = 0; way_index < dcache.dcache_cfg.ways; way_index++) {
+            //     if (set->ways[way_index].valid && set->ways[way_index].tag == tag) {
+            //         set->ways[way_index].dirty = 1;
+            //         break;
+            //     }
+            // }
 
             break;
         }
@@ -427,17 +549,17 @@ void pipe_stage_mem()
             val = op->mem_value;
             mem_write_32(op->mem_addr & ~3, val);
 
-            // mark dirty bit
-            uint32_t idx = dc_index(op->mem_addr);
-            uint32_t tag = dc_tag(op->mem_addr);
-            DataCacheSet *set = &dcache.sets[idx];
+            // // mark dirty bit
+            // uint32_t idx = dc_index(op->mem_addr);
+            // uint32_t tag = dc_tag(op->mem_addr);
+            // DataCacheSet *set = &dcache.sets[idx];
 
-            for (int way_index = 0; way_index < DC_NUM_WAYS; way_index++) {
-                if (set->ways[way_index].valid && set->ways[way_index].tag == tag) {
-                    set->ways[way_index].dirty = 1;
-                    break;
-                }
-            }
+            // for (int way_index = 0; way_index < dcache.dcache_cfg.ways; way_index++) {
+            //     if (set->ways[way_index].valid && set->ways[way_index].tag == tag) {
+            //         set->ways[way_index].dirty = 1;
+            //         break;
+            //     }
+            // }
 
             break;
         }
@@ -883,10 +1005,10 @@ void pipe_stage_decode()
 
 void pipe_stage_fetch()
 {
-    if (!RUN_BIT) { //update pc by 4 if we return early because of a stall
-        pipe.PC += 4;
-        return;
-    }
+    // if (!RUN_BIT) { //update pc by 4 if we return early because of a stall
+    //     pipe.PC += 4;
+    //     return;
+    // }
 
     /* if pipeline is stalled (our output slot is not empty), return */
     if (pipe.decode_op != NULL)
