@@ -883,6 +883,11 @@ void pipe_stage_decode()
 
 void pipe_stage_fetch()
 {
+    if (!RUN_BIT) { //update pc by 4 if we return early because of a stall
+        pipe.PC += 4;
+        return;
+    }
+
     /* if pipeline is stalled (our output slot is not empty), return */
     if (pipe.decode_op != NULL)
         return;
